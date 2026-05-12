@@ -1,118 +1,212 @@
 import os
+import random
 from PIL import Image
-import numpy as np
-from tqdm import tqdm
+import matplotlib.pyplot as plt
 
 import torch
 import torch.nn as nn
-import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
+
+from tqdm import tqdm
+import numpy as np
 
 # --------------------
 # Config
 # --------------------
-DATASET_DIR = "CAID"
+DATASET_DIR = "/Users/SaiSanjayD/Documents/PythonPrograms/CAID"
+
 IMG_DIR = os.path.join(DATASET_DIR, "JPEGImages")
 MASK_DIR = os.path.join(DATASET_DIR, "SegmentationClass")
 
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-IMG_SIZE = 128
-EPOCHS = 5
-LR = 1e-3
+IMG_SIZE = 128      # smaller = faster training
+BATCH_SIZE = 4
+EPOCHS = 3          # quick training
+TRAIN_SPLIT = 0.8
+SEED = 42
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # --------------------
-# Dataset (minimal)
+# Load official splits
 # --------------------
-files = sorted(os.listdir(IMG_DIR))
 
+def load_split(path):
+    with open(path, "r") as f:
+        return [line.strip() for line in f.readlines()]
+
+train_txt = "/Users/SaiSanjayD/Documents/PythonPrograms/CAID/ImageSets/Segmentation/train.txt"
+val_txt   = "/Users/SaiSanjayD/Documents/PythonPrograms/CAID/ImageSets/Segmentation/val.txt"
+test_txt  = "/Users/SaiSanjayD/Documents/PythonPrograms/CAID/ImageSets/Segmentation/test.txt"
+
+train_files = load_split(train_txt)
+val_files   = load_split(val_txt)
+test_files  = load_split(test_txt)
+
+# combine train + val
+train_files = train_files + val_files
+
+# --------------------
+# Dataset
+# --------------------
 img_tf = transforms.Compose([
     transforms.Resize((IMG_SIZE, IMG_SIZE)),
     transforms.ToTensor()
 ])
 
-mask_tf = transforms.Compose([
-    transforms.Resize((IMG_SIZE, IMG_SIZE)),
-    transforms.PILToTensor()
-])
+mask_tf = transforms.Resize(
+    (IMG_SIZE, IMG_SIZE),
+    interpolation=transforms.InterpolationMode.NEAREST
+)
 
-def load_sample(f):
-    img = Image.open(os.path.join(IMG_DIR, f)).convert("RGB")
-    mask = Image.open(os.path.join(MASK_DIR, f)).convert("L")
-    return img_tf(img), mask_tf(mask).squeeze(0).long()
+class SegmentationDataset(Dataset):
+    def __init__(self, file_list):
+        self.file_list = file_list
+
+    def __len__(self):
+        return len(self.file_list)
+
+    def __getitem__(self, idx):
+        filename = self.file_list[idx]
+
+        img_path = os.path.join(IMG_DIR, filename + ".png")
+        mask_path = os.path.join(MASK_DIR, filename + ".png")
+
+        image = Image.open(img_path).convert("RGB")
+        mask = Image.open(mask_path)
+
+        image = img_tf(image)
+        mask = mask_tf(mask)
+
+        mask = torch.tensor(np.array(mask), dtype=torch.float32).unsqueeze(0)
+        mask = (mask > 0).float()
+
+        return image, mask
+
+train_dataset = SegmentationDataset(train_files)
+test_dataset = SegmentationDataset(test_files)
+
+train_loader = DataLoader(
+    train_dataset,
+    batch_size=BATCH_SIZE,
+    shuffle=True
+)
+
+test_loader = DataLoader(
+    test_dataset,
+    batch_size=1,
+    shuffle=False
+)
 
 # --------------------
-# Tiny model (very small CNN)
+# Minimal CNN Model
 # --------------------
-class TinySeg(nn.Module):
+class SimpleSegNet(nn.Module):
     def __init__(self):
         super().__init__()
-        self.net = nn.Sequential(
+
+        self.model = nn.Sequential(
             nn.Conv2d(3, 16, 3, padding=1),
             nn.ReLU(),
+
             nn.Conv2d(16, 32, 3, padding=1),
             nn.ReLU(),
-            nn.Conv2d(32, 2, 1)  # assume binary-ish segmentation
+
+            nn.Conv2d(32, 1, 1),
+            nn.Sigmoid()
         )
 
     def forward(self, x):
-        return self.net(x)
+        return self.model(x)
 
-model = TinySeg().to(DEVICE)
-opt = optim.Adam(model.parameters(), lr=LR)
-loss_fn = nn.CrossEntropyLoss()
+model = SimpleSegNet().to(device)
+
+criterion = nn.BCELoss()
+optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
 
 # --------------------
-# Train loop
+# Train
 # --------------------
-model.train()
-
-for epoch in range(EPOCHS):
+for epoch in tqdm(range(EPOCHS), desc="Epoch"):
+    model.train()
     total_loss = 0
 
-    loop = tqdm(files, desc=f"Epoch {epoch+1}/{EPOCHS}")
+    for images, masks in tqdm(train_loader, desc="Training", leave=False):
+        images = images.to(device)
+        masks = masks.to(device)
 
-    for f in loop:
-        img, mask = load_sample(f)
-        img, mask = img.to(DEVICE), mask.to(DEVICE)
+        preds = model(images)
 
-        img = img.unsqueeze(0)
+        loss = criterion(preds, masks)
 
-        pred = model(img)
-
-        loss = loss_fn(pred, mask.unsqueeze(0))
-
-        opt.zero_grad()
+        optimizer.zero_grad()
         loss.backward()
-        opt.step()
+        optimizer.step()
 
         total_loss += loss.item()
-        loop.set_postfix(loss=loss.item())
 
-    print(f"Epoch {epoch+1} Loss: {total_loss/len(files):.4f}")
+print("Training complete.")
 
 # --------------------
-# Evaluation (pixel accuracy)
+# Pixel Accuracy
 # --------------------
 model.eval()
 
-correct = 0
-total = 0
+correct_pixels = 0
+total_pixels = 0
 
 with torch.no_grad():
-    loop = tqdm(files, desc="Evaluating")
+    for images, masks in test_loader:
 
-    for f in loop:
-        img, mask = load_sample(f)
-        img, mask = img.to(DEVICE), mask.to(DEVICE)
+        images = images.to(device)
+        masks = masks.to(device)
 
-        img = img.unsqueeze(0)
-        pred = model(img)
+        preds = model(images)
 
-        pred_class = pred.argmax(1).squeeze(0)
+        # Convert probabilities -> binary mask
+        preds = (preds > 0.5).float()
 
-        correct += (pred_class == mask).sum().item()
-        total += mask.numel()
+        # Count matching pixels
+        correct_pixels += (preds == masks).sum().item()
+        total_pixels += masks.numel()
 
-        loop.set_postfix(acc=correct/total)
+pixel_accuracy = correct_pixels / total_pixels
 
-print(f"\nFinal Pixel Accuracy: {correct/total:.4f}")
+print(f"Pixel Accuracy: {pixel_accuracy * 100:.2f}%")
+
+# --------------------
+# Show Predictions
+# --------------------
+
+fig, axes = plt.subplots(2, 3, figsize=(10, 7))
+
+with torch.no_grad():
+    for i in range(2):
+
+        image, true_mask = test_dataset[i]
+
+        input_img = image.unsqueeze(0).to(device)
+
+        pred_mask = model(input_img)
+
+        pred_mask = pred_mask.squeeze().cpu().numpy()
+        pred_mask = (pred_mask > 0.5)
+
+        image_np = image.permute(1, 2, 0).numpy()
+        true_mask_np = true_mask.squeeze().numpy()
+
+        axes[i, 0].imshow(image_np)
+        axes[i, 0].set_title("Actual Image")
+        axes[i, 0].axis("off")
+
+        axes[i, 1].imshow(true_mask_np, cmap="gray")
+        axes[i, 1].set_title("Actual Mask")
+        axes[i, 1].axis("off")
+
+        axes[i, 2].imshow(pred_mask, cmap="gray")
+        axes[i, 2].set_title("Predicted Mask")
+        axes[i, 2].axis("off")
+
+plt.tight_layout()
+plt.show()
+
